@@ -1,0 +1,71 @@
+[project]
+name = "cp-finder"
+version = "0.1.0"
+description = "Find conceptually similar competitive programming problems across Codeforces, CodeChef, and LeetCode"
+requires-python = ">=3.11"
+dependencies = [
+    # Core
+    "pydantic>=2.7,<3",
+    "pydantic-settings>=2.3,<3",
+    "python-dotenv>=1.0,<2",
+
+    # Database
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "psycopg[binary]>=3.1,<4",
+    "alembic>=1.13,<2",
+    "pgvector>=0.3,<1",
+
+    # HTTP / Ingestion
+    "httpx>=0.27,<1",
+    "beautifulsoup4>=4.12,<5",
+    "lxml>=5.2,<6",
+
+    # AI / ML
+    "anthropic>=0.49,<1",
+    "voyageai>=0.3,<1",
+    "numpy>=1.26,<3",
+
+    # API
+    "fastapi>=0.111,<1",
+    "uvicorn[standard]>=0.30,<1",
+
+    # CLI
+    "click>=8.1,<9",
+    "rich>=13.7,<14",
+
+    # Scheduling
+    "apscheduler>=3.10,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<9",
+    "pytest-asyncio>=0.23,<1",
+    "ruff>=0.4,<1",
+    "mypy>=1.10,<2",
+]
+ranking = [
+    "lightgbm>=4.3,<5",
+    "scikit-learn>=1.5,<2",
+]
+
+[project.scripts]
+cp-finder = "cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["db*", "ingestion*", "extraction*", "matching*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
