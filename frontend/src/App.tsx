@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Search, Sparkles, BrainCircuit, LayoutList, Network } from 'lucide-react';
 import ResultCard from './components/ResultCard';
 import SimilarityGraph from './components/SimilarityGraph';
+import InteractiveBackground from './components/InteractiveBackground';
 import './index.css';
 
 // Types
@@ -74,8 +75,10 @@ export default function App() {
   };
 
   return (
-    <div className="app-container">
-      <header className="header">
+    <>
+      <InteractiveBackground />
+      <div className="app-container">
+        <header className="header">
         <h1>CP Problem Finder</h1>
         <p>Paste a Codeforces URL or raw problem text to find conceptually similar problems.</p>
       </header>
@@ -172,5 +175,6 @@ export default function App() {
         </div>
       )}
     </div>
+    </>
   );
 }

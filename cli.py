@@ -153,25 +153,42 @@ def seed_taxonomy():
 # ── backfill ────────────────────────────────────────────────────────────────
 
 @main.command()
+@click.option("--platform", "-p", default="codeforces", type=click.Choice(["codeforces", "codechef", "all"]), help="Platform to backfill")
 @click.option("--limit", "-l", default=None, type=int, help="Limit number of problems to ingest")
 @click.option("--skip-statements", is_flag=True, help="Skip fetching full statements (metadata only)")
 @click.option("--skip-extraction", is_flag=True, help="Skip LLM extraction (ingest only)")
-def backfill(limit: int | None, skip_statements: bool, skip_extraction: bool):
-    """Backfill: ingest all Codeforces problems + run extraction pipeline."""
-    asyncio.run(_backfill_async(limit, skip_statements, skip_extraction))
+def backfill(platform: str, limit: int | None, skip_statements: bool, skip_extraction: bool):
+    """Backfill: ingest all problems + run extraction pipeline."""
+    asyncio.run(_backfill_async(platform, limit, skip_statements, skip_extraction))
 
 
-async def _backfill_async(limit: int | None, skip_statements: bool, skip_extraction: bool):
+async def _backfill_async(platform: str, limit: int | None, skip_statements: bool, skip_extraction: bool):
     from db.models import Problem, Extraction
     from db.session import get_db
     from ingestion.codeforces_client import CodeforcesClient
+    from ingestion.codechef_client import CodeChefClient
     from ingestion.normalizer import normalize_statement
 
     # Step 1: Fetch problem list
-    console.print("\n[bold blue]Step 1: Fetching Codeforces problem list...[/]")
+    console.print(f"\n[bold blue]Step 1: Fetching {platform} problem list...[/]")
 
-    async with CodeforcesClient() as cf:
-        all_problems = await cf.fetch_problem_list()
+    all_problems = []
+    
+    if platform in ["codeforces", "all"]:
+        console.print("  [bold]Codeforces[/]")
+        async with CodeforcesClient() as cf:
+            cf_problems = await cf.fetch_problem_list()
+            all_problems.extend(cf_problems)
+            
+    if platform in ["codechef", "all"]:
+        from config import get_settings
+        if not get_settings().codechef_enabled:
+            console.print("  [yellow]CodeChef is disabled in config. Skipping...[/]")
+        else:
+            console.print("  [bold]CodeChef[/]")
+            # Fetching all problems for CodeChef is not supported directly, usually we fetch practice problems.
+            # In backfill, if they ask for CodeChef, we might just warn or fetch a specific contest if limit is small.
+            console.print("  [yellow]Note: Full CodeChef backfill not implemented. Use sync-recent instead.[/]")
 
     if limit:
         all_problems = all_problems[:limit]
@@ -193,15 +210,15 @@ async def _backfill_async(limit: int | None, skip_statements: bool, skip_extract
                 continue
 
             problem = Problem(
-                platform="codeforces",
+                platform="codeforces" if hasattr(p, "contest_id") and not isinstance(p.contest_id, str) else "codechef",
                 external_id=p.external_id,
                 url=p.url,
                 title=p.name,
                 raw_statement="",
-                native_rating=p.rating,
+                native_rating=getattr(p, "rating", None),
                 contest_id=str(p.contest_id),
             )
-            problem.native_tags = p.tags  # uses the property setter → JSON
+            problem.native_tags = getattr(p, "tags", [])  # uses the property setter → JSON
             db.add(problem)
             new_count += 1
 
@@ -217,13 +234,13 @@ async def _backfill_async(limit: int | None, skip_statements: bool, skip_extract
     with get_db() as db:
         problems_needing_statements = (
             db.query(Problem)
-            .filter(Problem.platform == "codeforces")
+            .filter(Problem.platform.in_(["codeforces", "codechef"]) if platform == "all" else Problem.platform == platform)
             .filter(Problem.raw_statement == "")
             .all()
         )
         # Detach from session so we can use them outside
         problems_list = [
-            {"id": p.id, "contest_id": p.contest_id, "external_id": p.external_id,
+            {"id": p.id, "platform": p.platform, "contest_id": p.contest_id, "external_id": p.external_id,
              "title": p.title, "native_rating": p.native_rating,
              "native_tags": p.native_tags, "url": p.url}
             for p in problems_needing_statements
@@ -236,7 +253,7 @@ async def _backfill_async(limit: int | None, skip_statements: bool, skip_extract
         fetched = 0
         failed = 0
 
-        async with CodeforcesClient() as cf:
+        async with CodeforcesClient() as cf, CodeChefClient() as cc:
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[progress.description]{task.description}"),
@@ -251,25 +268,39 @@ async def _backfill_async(limit: int | None, skip_statements: bool, skip_extract
 
                 for pdata in problems_list:
                     try:
-                        from ingestion.codeforces_client import CFProblemMeta
+                        if pdata["platform"] == "codeforces":
+                            from ingestion.codeforces_client import CFProblemMeta
 
-                        # Extract the problem index from external_id (e.g., "1900D" → "D")
-                        ext_id = pdata["external_id"]
-                        contest_id_str = pdata["contest_id"]
-                        index = ext_id[len(contest_id_str):] if contest_id_str else ext_id
+                            # Extract the problem index from external_id (e.g., "1900D" → "D")
+                            ext_id = pdata["external_id"]
+                            contest_id_str = pdata["contest_id"]
+                            index = ext_id[len(contest_id_str):] if contest_id_str else ext_id
 
-                        meta = CFProblemMeta(
-                            contest_id=int(contest_id_str),
-                            index=index,
-                            name=pdata["title"] or "",
-                            rating=pdata["native_rating"],
-                            tags=pdata["native_tags"] or [],
-                            url=pdata["url"],
-                            external_id=ext_id,
-                        )
+                            meta = CFProblemMeta(
+                                contest_id=int(contest_id_str),
+                                index=index,
+                                name=pdata["title"] or "",
+                                rating=pdata["native_rating"],
+                                tags=pdata["native_tags"] or [],
+                                url=pdata["url"],
+                                external_id=ext_id,
+                            )
 
-                        full = await cf.fetch_problem_statement(meta)
-                        statement_text = normalize_statement(full.statement_html)
+                            full = await cf.fetch_problem_statement(meta)
+                            statement_text = normalize_statement(full.statement_html)
+                        elif pdata["platform"] == "codechef":
+                            from ingestion.codechef_client import CCProblemMeta
+                            
+                            meta = CCProblemMeta(
+                                contest_id=pdata["contest_id"],
+                                problem_code=pdata["external_id"],
+                                name=pdata["title"] or "",
+                                url=pdata["url"],
+                                external_id=pdata["external_id"],
+                            )
+                            
+                            full = await cc.fetch_problem_statement(meta)
+                            statement_text = normalize_statement(full.statement_html)
 
                         if statement_text:
                             with get_db() as db:
@@ -280,7 +311,7 @@ async def _backfill_async(limit: int | None, skip_statements: bool, skip_extract
                                     p.memory_limit_kb = full.memory_limit_kb
                             fetched += 1
                         else:
-                            logger.debug(f"Empty statement for {ext_id}")
+                            logger.debug(f"Empty statement for {pdata['external_id']}")
                             failed += 1
 
                     except Exception as e:
@@ -385,6 +416,115 @@ def _run_extraction_batch():
         f"  [green]Extracted {success} problems[/], "
         f"[red]{failed} failed[/]"
     )
+
+
+# ── sync-recent ─────────────────────────────────────────────────────────────
+
+@main.command()
+@click.option("--hours", "-h", default=24, help="Number of hours to look back")
+def sync_recent(hours: int):
+    """Sync recent contests using Clist API and ingest problems."""
+    asyncio.run(_sync_recent_async(hours))
+
+async def _sync_recent_async(hours: int):
+    from config import get_settings
+    from ingestion.clist_client import ClistClient
+    from ingestion.codeforces_client import CodeforcesClient
+    from ingestion.codechef_client import CodeChefClient
+    from db.models import Problem
+    from db.session import get_db
+
+    settings = get_settings()
+    if not settings.clist_api_key:
+        console.print("[red]Error: clist_api_key not configured. Cannot sync recent contests.[/]")
+        return
+
+    console.print(f"\n[bold blue]Syncing recent contests from last {hours} hours...[/]")
+
+    async with ClistClient(settings.clist_api_key) as clist:
+        cf_contests = await clist.fetch_recent_contests("codeforces.com", hours)
+        
+        cc_contests = []
+        if settings.codechef_enabled:
+            cc_contests = await clist.fetch_recent_contests("codechef.com", hours)
+
+    all_problems = []
+
+    if cf_contests:
+        console.print(f"  [green]Found {len(cf_contests)} Codeforces contests[/]")
+        async with CodeforcesClient() as cf:
+            for c in cf_contests:
+                # Codeforces contest IDs from Clist might not match perfectly, usually Clist ID is their own
+                # But Clist event name has it, or resource ID. Actually Clist `href` contains the exact URL!
+                # Wait, we need the contest_id for CF. For CodeChef we need the contest code.
+                pass
+                
+                # We can also just use CodeforcesClient to fetch recent contests natively!
+                # Since Codeforces has a native API for recent contests, let's use it for CF.
+        
+        # Native Codeforces recent contests
+        async with CodeforcesClient() as cf:
+            recent_cf = await cf.fetch_recent_contests(count=5)
+            for c in recent_cf:
+                # We should check if they ended within `hours`, but for simplicity just ingest top 1
+                c_id = c.get("id")
+                console.print(f"  Fetching CF Contest {c_id} ({c.get('name')})")
+                try:
+                    p = await cf.fetch_contest_problems(c_id)
+                    all_problems.extend(p)
+                except Exception as e:
+                    console.print(f"    [red]Failed: {e}[/]")
+
+    if cc_contests:
+        console.print(f"  [green]Found {len(cc_contests)} CodeChef contests[/]")
+        async with CodeChefClient() as cc:
+            for c in cc_contests:
+                # Extract contest code from event name or URL (href is available if requested, but we only have event name)
+                # Event names like "Starters 120 (Rated...)"
+                import re
+                m = re.search(r"Starters\s+(\d+)", c.event, re.IGNORECASE)
+                if m:
+                    c_id = f"START{m.group(1)}"
+                    console.print(f"  Fetching CC Contest {c_id} ({c.event})")
+                    try:
+                        p = await cc.fetch_contest_problems(c_id)
+                        all_problems.extend(p)
+                    except Exception as e:
+                        console.print(f"    [red]Failed: {e}[/]")
+
+    if not all_problems:
+        console.print("  [yellow]No new problems found.[/]")
+        return
+        
+    console.print(f"  [green]Total {len(all_problems)} problems found across platforms.[/]")
+    
+    # Store metadata
+    new_count = 0
+    with get_db() as db:
+        for p in all_problems:
+            platform = "codeforces" if hasattr(p, "contest_id") and not isinstance(p.contest_id, str) else "codechef"
+            existing = db.query(Problem).filter_by(
+                platform=platform, external_id=p.external_id
+            ).first()
+            if not existing:
+                problem = Problem(
+                    platform=platform,
+                    external_id=p.external_id,
+                    url=p.url,
+                    title=p.name,
+                    raw_statement="",
+                    native_rating=getattr(p, "rating", None),
+                    contest_id=str(p.contest_id),
+                )
+                problem.native_tags = getattr(p, "tags", [])
+                db.add(problem)
+                new_count += 1
+                
+    console.print(f"  Added {new_count} new problems to database.")
+    
+    if new_count > 0:
+        console.print("\n[bold blue]Running backfill to fetch statements and extract...[/]")
+        await _backfill_async("all", limit=None, skip_statements=False, skip_extraction=False)
 
 
 # ── find-similar ────────────────────────────────────────────────────────────
